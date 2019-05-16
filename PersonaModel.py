@@ -9,7 +9,7 @@ import sys
 import traceback
 import PrintUtil
 import HyperparameterOptimization
-from scipy import sparse
+from scipy.sparse import bsr_matrix
 
 class IterInfo(object):
     def __init__(self):
@@ -159,7 +159,6 @@ class PersonaModel:
                 if e.getNumEvents() > 0:
                     e.saveFinalSample(e.currentType)
 
-                
     def regress(self) -> None:
         """
         Run multiclass logistic regression using all samples in responses. Clear
@@ -169,14 +168,31 @@ class PersonaModel:
 
     def setDocumentPriors(self) -> None:
         """
-        Once the model is trained, set the document priors (which don't change
-        between logreg runs).
+        Once the model is trained, set the document priors for entities in the doc and
+        the doc itself (which don't change between LogReg() runs).
         """
         for doc in self.data:
             doc: Doc
             for e in doc.entities.values():
                 e: Entity
+                if e.getNumEvents() > 0:
 
+                    docPredictor: np.ndarray = np.zeros(self.numFeatures)
+                    characterPredictor: np.ndarray = np.zeros(self.numFeatures)
+
+                    if doc.genres is not None:
+                        genreIDs = [self.featureIds[genre] for genre in doc.genres]
+                        docPredictor[genreIDs] = 1.0
+                        characterPredictor[genreIDs] = 1.0
+
+                        characterFeatures: Set[int] = e.getCharacterFeatures()
+                        characterPredictor[list(characterFeatures)] = 1.0
+
+                    docDistribution: np.ndarray = self.model.predict(docPredictor)
+                    characterDistribution: np.ndarray = self.model.predict(characterPredictor)
+
+                    e.prior = characterDistribution
+                    doc.prior = docDistribution
 
     def generateConditionalPosterior(self) -> None:
         """
@@ -185,7 +201,66 @@ class PersonaModel:
 	    could be interesting to analyze how a character's actions deviates from
 	    the most likely persona).
         """
-        pass
+        samples: int = 100
+
+        for doc in self.data:
+            doc: Doc
+            for e in doc.entities.values():
+                e: Entity
+                posterior: np.ndarray = e.posterior
+                mode: int = np.argmax(posterior).item()
+
+                conditionalAgentSamples: np.ndarray = np.full(self.K, 0)
+                for arg in e.agentArgs:
+                    prob: np.ndarray = np.full(self.K, 1.0)
+
+                    for j in range(self.K):
+                        prob[j] *= self.unaryLFactor(arg, j, mode)
+                        prob[j] *= self.unaryEmissionFactor(arg, j)
+
+                    prob = prob / np.sum(prob)
+                    new_zs = np.random.choice(self.K, samples, p=prob)
+                    conditionalAgentSamples[new_zs] += 1
+
+                # normalize
+                conditionalAgentNorm = np.sum(conditionalAgentSamples)
+                if conditionalAgentNorm > 0: # TODO bug? 1?
+                    conditionalAgentSamples = conditionalAgentSamples / conditionalAgentNorm
+                e.conditionalAgentPosterior = conditionalAgentSamples
+
+                conditionalPatientSamples: np.ndarray = np.full(self.K, 0.0)
+                for arg in e.patientArgs:
+                    prob: np.ndarray = np.full(self.K, 1.0)
+
+                    for j in range(self.K):
+                        prob[j] *= self.unaryLFactor(arg, j, mode)
+                        prob[j] *= self.unaryEmissionFactor(arg, j)
+
+                    prob = prob / np.sum(prob)
+                    new_zs = np.random.choice(self.K, samples, p=prob)
+                    conditionalPatientSamples[new_zs] += 1
+
+                conditionalPatientNorm = np.sum(conditionalPatientSamples)
+                if conditionalPatientNorm > 0:  # TODO bug? 1?
+                    conditionalPatientSamples = conditionalPatientSamples / conditionalPatientNorm
+                e.conditionalPatientPosterior = conditionalPatientSamples
+
+                conditionalModSamples: np.ndarray = np.full(self.K, 0.0)
+                for arg in e.modifieeArgs:
+                    prob: np.ndarray = np.full(self.K, 1.0)
+
+                    for j in range(self.K):
+                        prob[j] *= self.unaryLFactor(arg, j, mode)
+                        prob[j] *= self.unaryEmissionFactor(arg, j)
+
+                    prob = prob / np.sum(prob)
+                    new_zs = np.random.choice(self.K, samples, p=prob)
+                    conditionalModSamples[new_zs] += 1
+
+                conditionalModNorm = np.sum(conditionalModSamples)
+                if conditionalModNorm > 0:  # TODO bug? 1?
+                    conditionalModSamples = conditionalModSamples / conditionalModNorm
+                e.conditionalModPosterior = conditionalModSamples
 
     def generatePosteriors(self) -> None:
         """
@@ -259,7 +334,38 @@ class PersonaModel:
         return (self.phis[k, verb] + self.gamma) / norm
 
     def LDASamplePersonas(self, first: bool) -> None:
-        pass
+        for doc in self.data:
+            doc: Doc
+
+            for entity in doc.entities.values():
+                if not first:
+                    doc.currentPersonaSamples[entity.currentType] -= 1.0
+
+                ########## eq. (1) ##########
+                regprobs = np.full(self.A, 1.0)
+
+                for j in range(self.A):
+                    # first term
+                    regprobs[j] *= doc.currentPersonaSamples[j] + self.alpha
+
+                    # second term
+                    for e in entity.agentArgs:
+                        regprobs[j] *= self.unaryLFactor(e, e.currentSample, j)
+                    for e in entity.patientArgs:
+                        regprobs[j] *= self.unaryLFactor(e, e.currentSample, j)
+                    for e in entity.modifieeArgs:
+                        regprobs[j] *= self.unaryLFactor(e, e.currentSample, j)
+
+                # normalize the probability
+                regprobs = regprobs / np.sum(regprobs)
+
+                # draw a sample from multinomial
+                new_z: int = np.random.choice(self.A, 1, p=regprobs).item()
+
+                entity.lastType = entity.currentType
+                entity.currentType = new_z
+
+                doc.currentPersonaSamples[entity.currentType] += 1.0
 
     def LogRegSample(self) -> float:
         ll: float = 0.0
@@ -270,7 +376,10 @@ class PersonaModel:
                 regprobs: np.ndarray = np.full(self.A, 1.0)
 
                 for j in range(self.A):
+                    # first term
                     regprobs[j] *= characterPrior[j]
+
+                    # second term
                     for e in entity.agentArgs:
                         regprobs[j] *= self.unaryLFactor(e, e.currentSample, j)
                     for e in entity.patientArgs:
@@ -280,9 +389,11 @@ class PersonaModel:
 
                 # normalize the probability
                 regprobs = regprobs / np.sum(regprobs)
-                # draw a sample from multinomial with
-                new_z: np.ndarray = np.random.choice(self.A, 1, p=regprobs)
+
+                # draw a sample from multinomial
+                new_z: int = np.random.choice(self.A, 1, p=regprobs).item()
                 ll += np.log(characterPrior[new_z]).item()
+
                 entity.lastType = entity.currentType
                 entity.currentType = new_z
         return ll
@@ -301,10 +412,33 @@ class PersonaModel:
             for t in doc.eventTuples:
                 t: EventTuple
                 for arg in t.arguments.values():
-                    old_z = arg.currentSample
+
+                    old_z: int = arg.currentSample
+
                     if not first:
                         self.incrementClassInfo(-1, arg, old_z, arg.entity.lastType)
 
+                    regprobs = np.full(self.K, 1.0)
+
+                    for k in range(self.K):
+                        regprobs[k] *= self.unaryLFactor(arg, k, arg.entity.currentType)
+
+                        regprobs[k] *= self.unaryEmissionFactor(arg, k)
+
+                    total: float = np.sum(regprobs).item()
+                    if total <= 0:
+                        print(f"0 sum {regprobs}")
+                        sys.exit(1)
+
+                    new_z: int = np.random.choice(self.K, 1, p=regprobs).item()
+
+                    self.incrementClassInfo(1, arg, new_z, arg.entity.currentType)
+                    arg.currentSample = new_z
+
+                    assert regprobs[new_z] / total >= 0
+                    info.numClassChanges += 1 if old_z != new_z else 0
+
+        return info
 
 
 if __name__ == "__main__":
