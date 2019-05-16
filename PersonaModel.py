@@ -2,14 +2,15 @@ from typing import *
 from containers import *
 import numpy as np
 from sklearn.linear_model import LogisticRegression
-from SparseMulticlassLogisticRegression import SparseMulticlassLogisticRegression
 from jproperties import Properties
 import random
 import sys
 import traceback
 import PrintUtil
+import DataReader
 import HyperparameterOptimization
-from scipy.sparse import bsr_matrix
+from SparseMulticlassLogisticRegression import SparseMulticlassLogisticRegression
+
 
 class IterInfo(object):
     def __init__(self):
@@ -97,6 +98,7 @@ class PersonaModel:
         self.movieGenres: Dict[str, Set[str]] or None = None
 
         # for logistic regression: set of predictors, response counts (for each of K classes)
+        # totalEntities x A
         self.responses: np.ndarray or None = None
 
         self.reg: SparseMulticlassLogisticRegression or None = None
@@ -164,7 +166,60 @@ class PersonaModel:
         Run multiclass logistic regression using all samples in responses. Clear
         response counts at the end.
         """
-        pass
+        def hash_ndarray(x: np.ndarray):
+            return hash(tuple(x))
+
+        regressionResponses: np.ndarray = np.zeros((self.totalEntities, self.A))
+        regressionPredictors: np.ndarray= np.zeros((self.totalEntities, self.A))
+
+        vectors: Dict[str, np.ndarray] = {}
+        indices: Dict[int, int] = {}  # this is different from original java code because ndarray is not hashable
+        maxInt: int = 0
+
+        for doc in self.data:
+            for e in doc.entities.values():
+                if e.getNumEvents() > 0:
+                    index: int = e.canonicalIndex
+                    predictor: np.ndarray = np.zeros(self.numFeatures)
+
+                    sampleCount: int = np.sum(self.responses[index]).item()
+
+                    if sampleCount > 0:
+                        if doc.genres is not None:
+                            genreIDs = [self.featureIds[genre] for genre in doc.genres]
+
+                            predictor[genreIDs] = 1.0
+                            predictor[list(e.getCharacterFeatures())] = 1.0
+
+                        # Group everything by unique combinations of features
+                        key = str(predictor)
+                        if key in vectors:
+                            source_index: int = indices[hash_ndarray(vectors[key])]
+                            keeper: np.ndarray = regressionResponses[source_index]
+
+                            keeper += np.sum(self.responses[index], axis=1)
+                            regressionResponses[source_index] = keeper
+                        else:
+                            regressionPredictors[maxInt] = predictor
+                            vectors[str(predictor)] = predictor
+                            indices[hash_ndarray(predictor)] = maxInt
+                            regressionResponses[maxInt] = self.responses[index]
+                            maxInt += 1
+
+        # convert arraylist of responses to double array
+        regressionResponses: np.ndarray = regressionResponses[:maxInt]
+        regressionPredictors: np.ndarray = regressionPredictors[:maxInt]
+
+        self.featureMeans = np.zeros(self.numFeatures)
+
+        regressionPredictors[regressionPredictors != 0] = 1
+
+        self.featureMeans = np.sum(regressionPredictors, axis=1) / self.totalEntities
+
+        self.model = self.reg.regress(regressionPredictors, regressionResponses, self.numFeatures)
+        self.model.printWeightsToFile(self.weights, self.reverseFeatureIds, self.genreIdToString)
+
+        self.responses = np.zeros((self.totalEntities, self.A))
 
     def setDocumentPriors(self) -> None:
         """
@@ -185,8 +240,7 @@ class PersonaModel:
                         docPredictor[genreIDs] = 1.0
                         characterPredictor[genreIDs] = 1.0
 
-                        characterFeatures: Set[int] = e.getCharacterFeatures()
-                        characterPredictor[list(characterFeatures)] = 1.0
+                        characterPredictor[list(e.getCharacterFeatures())] = 1.0
 
                     docDistribution: np.ndarray = self.model.predict(docPredictor)
                     characterDistribution: np.ndarray = self.model.predict(characterPredictor)
