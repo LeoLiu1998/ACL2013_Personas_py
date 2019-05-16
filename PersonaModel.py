@@ -9,7 +9,7 @@ import sys
 import traceback
 import PrintUtil
 import HyperparameterOptimization
-
+from scipy import sparse
 
 class IterInfo(object):
     def __init__(self):
@@ -127,11 +127,39 @@ class PersonaModel:
         self.model = self.reg.getDefault(self.A, self.numFeatures)
 
     def saveSamples(self) -> None:
-        pass
+
+        for doc in self.data:
+            for e in doc.entities.values():
+                e: Entity
+                # it's possible that some entities have no Events
+                if e.getNumEvents() > 0:
+                    self.responses[e.canonicalIndex][e.currentType] += 1
+                    e.saveSample(e.currentType)
 
     def saveFinalSamples(self) -> None:
-        pass
+        for doc in self.data:
+            for e in doc.entities.values():
+                e: Entity
+                a: int = e.currentType
+                for arg in e.agentArgs:
+                    arg.saveFinalSample()
+                    self.finalLAgents[a][arg.currentSample] += 1
+                    self.finalPhis[arg.currentSample][arg.tuple.canonicalVerb] += 1
 
+                for arg in e.patientArgs:
+                    arg.saveFinalSample()
+                    self.finalLPatients[a][arg.currentSample] += 1
+                    self.finalPhis[arg.currentSample][arg.tuple.canonicalVerb] += 1
+
+                for arg in e.modifieeArgs:
+                    arg.saveFinalSample()
+                    self.finalLMod[a][arg.currentSample] += 1
+                    self.finalPhis[arg.currentSample][arg.tuple.canonicalVerb] += 1
+
+                if e.getNumEvents() > 0:
+                    e.saveFinalSample(e.currentType)
+
+                
     def regress(self) -> None:
         """
         Run multiclass logistic regression using all samples in responses. Clear
@@ -143,9 +171,12 @@ class PersonaModel:
         """
         Once the model is trained, set the document priors (which don't change
         between logreg runs).
-        :return:
         """
-        pass
+        for doc in self.data:
+            doc: Doc
+            for e in doc.entities.values():
+                e: Entity
+
 
     def generateConditionalPosterior(self) -> None:
         """
@@ -161,7 +192,10 @@ class PersonaModel:
         Generate an entity's posterior distribution over personas from saved
         samples; and then wipe those saved samples for the next iteration.
         """
-        pass
+        for doc in self.data:
+            for e in doc.entities.values():
+                e.posterior = e.getSamplePosterior()
+                e.posteriorSamples = np.full(self.A, 0.0)
 
     ############## z-level sampling inference stuff here  #######################
     #############################################################################

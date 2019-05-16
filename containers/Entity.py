@@ -14,6 +14,7 @@ class Entity(object):
 
         self.canonicalIndex: int or None = None
 
+        # current assignment of persona types (for EM setting)
         self.currentType: int = np.random.randint(0, A)
         self.lastType: int = self.currentType
 
